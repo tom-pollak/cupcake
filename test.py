@@ -5,10 +5,12 @@ import torch
 from monarch.actor import Actor, current_rank, endpoint
 
 import torchstore as ts
+
+
 from torchstore.utils import spawn_actors
 
 
-WORLD_SIZE = 1
+WORLD_SIZE = 5
 
 
 # In monarch, Actors are the way we represent multi-process/node applications. For additional details, see:

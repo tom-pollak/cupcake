@@ -1,3 +1,6 @@
 [submodule "torchstore"]
 	path = torchstore
 	url = https://github.com/meta-pytorch/torchstore.git
+[submodule "vllm"]
+	path = vllm
+	url = https://github.com/vllm-project/vllm.git
