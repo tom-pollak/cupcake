@@ -40,18 +40,30 @@ class PrefillWorker(Actor):
             dtypes.extend([str(key_tensor.dtype), str(value_tensor.dtype)])
 
         # Add the logits (last token only)
-        last_logits = out.logits[:, -1, :].contiguous()
+        last_logits = out.logits[:, -1, :]
         tensors_to_transfer.append(last_logits)
         shapes.append(list(last_logits.shape))
         dtypes.append(str(last_logits.dtype))
 
-        # Flatten all tensors into a single contiguous buffer
-        flat_tensors = [t.contiguous().view(-1) for t in tensors_to_transfer]
-        combined = torch.cat(flat_tensors)
+        # Calculate total bytes needed
+        total_bytes = 0
+        for tensor in tensors_to_transfer:
+            total_bytes += tensor.numel() * tensor.element_size()
 
-        # Create RDMA buffer from the combined tensor
-        buffer_bytes = combined.view(torch.uint8)
-        rdma_buffer = RDMABuffer(buffer_bytes)
+        # Allocate single contiguous buffer
+        flat_buffer = torch.empty(total_bytes, dtype=torch.uint8, device=self.device)
+
+        # Copy each tensor directly into the buffer (this is the only copy - unavoidable)
+        byte_offset = 0
+        for tensor in tensors_to_transfer:
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            flat_buffer[byte_offset : byte_offset + tensor_bytes].copy_(
+                tensor.view(-1).view(torch.uint8)
+            )
+            byte_offset += tensor_bytes
+
+        # Create RDMA buffer from the single flat buffer - no copy, just a reference
+        rdma_buffer = RDMABuffer(flat_buffer)
 
         # Store buffer and metadata
         self.rdma_buffers[key] = rdma_buffer
@@ -78,32 +90,38 @@ class DecodeWorker(Actor):
     async def decode(
         self, rdma_buffer: RDMABuffer, metadata: dict, max_new_tokens: int = 16
     ) -> str:
-        # Allocate local buffer for RDMA transfer
         shapes = metadata["shapes"]
         dtypes = metadata["dtypes"]
         num_layers = metadata["num_layers"]
 
-        # Calculate total size needed
-        total_elements = sum(torch.prod(torch.tensor(shape)).item() for shape in shapes)
-
-        # Allocate buffer and do RDMA read
-        local_buffer = torch.empty(total_elements, device=self.device)
-        buffer_bytes = local_buffer.view(torch.uint8)
-
-        # Zero-copy RDMA transfer
-        await rdma_buffer.read_into(buffer_bytes)
-
-        # Reconstruct tensors from the flat buffer
-        offset = 0
-        tensors = []
+        # Calculate total size in bytes for a single flat allocation
+        total_bytes = 0
+        element_sizes = []
         for shape, dtype_str in zip(shapes, dtypes):
             dtype = getattr(torch, dtype_str.split(".")[-1])
             num_elements = torch.prod(torch.tensor(shape)).item()
+            element_size = torch.tensor([], dtype=dtype).element_size()
+            total_bytes += num_elements * element_size
+            element_sizes.append((num_elements, element_size, dtype))
+
+        # Allocate one contiguous buffer as bytes
+        flat_buffer = torch.empty(total_bytes, dtype=torch.uint8, device=self.device)
+
+        # Zero-copy RDMA transfer directly into the single flat buffer
+        await rdma_buffer.read_into(flat_buffer)
+
+        # Create views (not copies) into the flat buffer for each tensor
+        byte_offset = 0
+        tensors = []
+        for shape, (num_elements, element_size, dtype) in zip(shapes, element_sizes):
+            # View into the flat buffer at the correct byte offset
             tensor = (
-                local_buffer[offset : offset + num_elements].view(dtype).reshape(shape)
+                flat_buffer[byte_offset : byte_offset + num_elements * element_size]
+                .view(dtype)
+                .reshape(shape)
             )
             tensors.append(tensor)
-            offset += num_elements
+            byte_offset += num_elements * element_size
 
         # Reconstruct past_key_values (tuple of tuples)
         past_key_values = []
