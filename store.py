@@ -16,7 +16,6 @@ class PrefillWorker(Actor):
         self.model = (
             AutoModelForCausalLM.from_pretrained(model_name).to(self.device).eval()
         )
-        # Store buffers for each session
         self.rdma_buffers = {}
         self.cache_metadata = {}
 
@@ -29,7 +28,6 @@ class PrefillWorker(Actor):
         with torch.no_grad():
             out = self.model(input_ids=input_ids, past_key_values=cache, use_cache=True)
 
-        # Flatten cache and logits into a single buffer
         tensors_to_transfer = []
         shapes = []
         dtypes = []
